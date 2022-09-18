@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import multiprocessing
 
-import ray
+# import ray
 from smart_open import open
 
 from mesh_transformer.util import head_print
@@ -79,7 +79,7 @@ def write_ckpt(pytree, dir, shard):
         # print(f"written to gcs in {time.time() - start:.06}s")
 
 
-def read_shard(ckpt_dir):
+def read_shard(ckpt_dir):  # XDC: correspond to split and write
     out = []
     for idx in range(16):
         file_path = ckpt_dir + f"{idx}.npz"
@@ -92,7 +92,7 @@ def read_shard(ckpt_dir):
     return out
 
 
-def reshard(x, old_shape):
+def reshard(x, old_shape):  # XDC: unused
     if len(x.shape) == 1:
         # print("epoch")
         # print(x)
@@ -131,7 +131,7 @@ def reshard(x, old_shape):
     return out
 
 
-def read_ckpt(pytree, dir, shards_in, shards_out=None, load_opt=True):
+def read_ckpt(pytree, dir, shards_in, shards_out=None, load_opt=True):  # XDC: shards_in = mp
     if shards_out is None:
         shards_out = shards_in
 
@@ -201,7 +201,7 @@ def read_ckpt_lowmem(pytree, dir, shards_in, shards_out=None, load_opt=True):
                         array.dtype = jnp.bfloat16
                     unstacked.append(array)
 
-                x = jax.device_put(jnp.stack(unstacked), device=devices[device_index % device_count])
+                x = jax.device_put(jnp.stack(unstacked), device=devices[device_index % device_count]) # XDC: correspond to index_weights
 
                 if shards_out != shards_in:
                     x = reshard(x, old_flattened[device_index].shape)

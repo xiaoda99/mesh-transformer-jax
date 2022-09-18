@@ -224,7 +224,7 @@ def leave_name_to_hf_layer_id(leaf_name: str):
 
 
 # TODO(nijkamp): rewrite this mess
-def reshard(x, old_shape, do_shard_ln, do_shard_bias):
+def reshard(x, old_shape, do_shard_ln, do_shard_bias):  # XDC: ***
     # reshards using numpy arrays so as to not fill up jax memory
     if len(x.shape) == 1:
         out = np.array(x[0:1])
@@ -233,7 +233,7 @@ def reshard(x, old_shape, do_shard_ln, do_shard_bias):
         if do_shard_ln:
             out = np.array(x[0:1])
         elif do_shard_bias:
-            out = np.reshape(np.sum(x, axis=0), old_shape)
+            out = np.reshape(np.sum(x, axis=0), old_shape)  # XDC: ***
         else:
             out = x.reshape(old_shape)
 
@@ -383,7 +383,7 @@ def save_pytree_as_hf(
         # remove first empty dimension and transpose.
         x = torch.tensor(x.squeeze(0), dtype=torch_dtype).T
 
-        # wte embedding weights/bias need to be combined since hf model has no wte.embedding.bias
+        # wte embedding weights/bias need to be combined since hf model has no wte.embedding.bias XDC: ???
         if hf_layer_id.startswith("transformer.wte"):
             # un/re-transpose since wte weight is only leave that shouldn't be transposed
             x = x.T

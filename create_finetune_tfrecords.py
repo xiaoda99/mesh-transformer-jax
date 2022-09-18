@@ -151,7 +151,7 @@ def write_tfrecord(sequences, fp):
     with tf.io.TFRecordWriter(fp) as writer:
         for seq in sequences:
             write_to_file(writer, seq)
-
+    
 
 def split_list(l, n):
     # splits list/string into n size chunks

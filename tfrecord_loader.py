@@ -87,6 +87,45 @@ class TFRecordNewInputs(TFRecordLoader):
         super().__init__(index_fname, batch_size, tf_parse, restore_state=restore_state)
 
 
+def _parse_function(example_proto): # https://zhuanlan.zhihu.com/p/552951305  # XD
+    feature_desc = {"input_ids": tf.io.VarLenFeature(tf.int64)}
+    example = tf.io.parse_single_example(example_proto, feature_desc)
+    for name in list(example.keys()):
+        t = example[name]
+        if t.dtype == tf.int64: t = tf.cast(t, dtype=tf.int32)
+        example[name] = tf.sparse.to_dense(t, default_value=0)
+        # example[name] = tf.sparse.to_dense(tf.sparse.reorder(t)) # mesh-transformer-jax
+    return example
+
+def shard(data, batch_size=None):  # XD
+    return jax.tree_map(lambda x: x.numpy().reshape(batch_size + x.shape[1:]), data)  # mtj
+
+def load_tfrecord_dataset(index_fname, batch_size, seq_len, restore_state=None):  # XD
+    # adapted from gpt-neo
+    fnames = [index_fname] if index_fname.endswith('.tfrecords') else open(index_fname).read().splitlines()
+    ds = tf.data.Dataset.from_tensor_slices(fnames)#.repeat()
+    ds = ds.apply(tf.data.TFRecordDataset)
+    # fp = index_fname; ds = tf.data.TFRecordDataset(fp)
+    # # ds = ds.shuffle(buffer_size=min(1000, len(sequences))) # flaxmodels, https://zhuanlan.zhihu.com/p/552951305
+    ds = ds.map(_parse_function, num_parallel_calls=tf.data.AUTOTUNE)
+    # gradient_accumulation_steps = 8
+    # mp_size, dp_size = 8, 1
+    # train_mbs_per_replica = 2 # train_micro_batch_size_per_gpu in deepspeed
+    # train_batch_size = (gradient_accumulation_steps, train_mbs_per_replica * dp_size)
+    # seq_len = 80  # max(len(s) for s in sequences) == 78
+    # ds = ds.apply(tf.data.experimental.dense_to_ragged_batch(np.prod(self.bs), drop_remainder=True)) # mtj
+    ds = ds.padded_batch(batch_size=np.prod(batch_size), padded_shapes={'input_ids': [seq_len]},
+                        padding_values={'input_ids': 0}, drop_remainder=True)
+    ds = ds.prefetch(10)  # mesh-transformer-jax
+    # ds = ds.repeat()  # gpt-neo/inputs.py
+    # map shard directly over ds won't work, getting AttributeError: 'Tensor' object has no attribute 'numpy'
+    # because inside tf.function?, see e.g.:
+    # 1) https://stackoverflow.com/questions/34097281/convert-a-tensor-to-numpy-array-in-tensorflow
+    # 2) https://github.com/tensorflow/tensorflow/issues/27519
+    # ds = ds.map(partial(shard, batch_size=batch_size), num_parallel_calls=tf.data.AUTOTUNE)
+    # matthias-wright/flaxmodels/training/stylegan2/data_pipeline.py
+    return map(lambda x: shard(x, batch_size=batch_size), iter(ds))
+
 class TFRecordWIT(TFRecordLoader):
     def __init__(self, index_fname, batch_size, restore_state=None, text_tokens=256):
         self.tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")

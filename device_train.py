@@ -6,17 +6,17 @@ import jax
 import numpy as np
 import optax
 
-import wandb
+# import wandb
 from tqdm import tqdm
 
 
 from mesh_transformer import util
 from mesh_transformer.checkpoint import read_ckpt, write_ckpt
 from mesh_transformer.transformer_shard import CausalTransformer
-from tfrecord_loader import TFRecordNewInputs
+from tfrecord_loader import TFRecordNewInputs, load_tfrecord_dataset
 from smart_open import open
-from google.cloud import storage
-from google.cloud.exceptions import NotFound
+# from google.cloud import storage
+# from google.cloud.exceptions import NotFound
 
 from mesh_transformer.util import clip_by_global_norm, additive_weight_decay
 
@@ -106,6 +106,7 @@ def save(network, step, bucket, path, mp, aux=None, keep_n=3, delete_old=True):
 
 
 def train_step(network, data):
+    data = data['input_ids']  # XD
     inputs = {
         "obs": data[:, :, :-1],
         "target": data[:, :, 1:],
@@ -205,25 +206,25 @@ if __name__ == "__main__":
         print('`--tune_model_path` passed: we are beginning a fine-tuning run')
         fine_tuning = True
         initial_ckpt_state_path = args.tune_model_path
-    else:
-        print('`--tune_model_path` not passed: we are continuing a fine-tuning run from a checkpoint (or we are not fine-tuning)')
-        fine_tuning = False
-        initial_ckpt_model_dir = model_dir
-        initial_ckpt_path = f"gs://{bucket}/{initial_ckpt_model_dir}"
-        meta_path = f"{initial_ckpt_path}/meta.json"
+    # else:  # XD
+    #     print('`--tune_model_path` not passed: we are continuing a fine-tuning run from a checkpoint (or we are not fine-tuning)')
+    #     fine_tuning = False
+    #     initial_ckpt_model_dir = model_dir
+    #     initial_ckpt_path = f"gs://{bucket}/{initial_ckpt_model_dir}"
+    #     meta_path = f"{initial_ckpt_path}/meta.json"
 
-        try:
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
-            ckpt_step = meta["checkpoints"][-1]
-            initial_ckpt_state_path = f"{initial_ckpt_path}/step_{ckpt_step}/"
-            print(f"state will be restored from checkpoint {ckpt_step}")
+    #     try:
+    #         with open(meta_path, "r") as f:
+    #             meta = json.load(f)
+    #         ckpt_step = meta["checkpoints"][-1]
+    #         initial_ckpt_state_path = f"{initial_ckpt_path}/step_{ckpt_step}/"
+    #         print(f"state will be restored from checkpoint {ckpt_step}")
 
-            step = ckpt_step
-            train_loader = meta['aux'][str(ckpt_step)].get("train_loader", None)
-        except NotFound:
-            # no checkpoint, start at zero
-            print(f"No checkpoint to load at {initial_ckpt_path}. Training from scratch.")
+    #         step = ckpt_step
+    #         train_loader = meta['aux'][str(ckpt_step)].get("train_loader", None)
+    #     except NotFound:
+    #         # no checkpoint, start at zero
+    #         print(f"No checkpoint to load at {initial_ckpt_path}. Training from scratch.")
 
     if initial_ckpt_state_path:
         print(f"path to load checkpoint from: {initial_ckpt_state_path}")
@@ -233,12 +234,16 @@ if __name__ == "__main__":
     # set up datasets
     print("setting up datasets")
 
-    train_dataset = TFRecordNewInputs(f"data/{params['train_set']}",
-                                      batch_size=(
-                                          gradient_accumulation_steps,
-                                          per_replica_batch * tpu_size // cores_per_replica),
-                                      sample_size=params['seq'],
-                                      restore_state=train_loader)
+    # train_dataset = TFRecordNewInputs(f"data/{params['train_set']}",
+    #                                   batch_size=(
+    #                                       gradient_accumulation_steps,
+    #                                       per_replica_batch * tpu_size // cores_per_replica),
+    #                                   sample_size=params['seq'],
+    #                                   restore_state=train_loader)
+    # XD
+    train_batch_size = (gradient_accumulation_steps, per_replica_batch * tpu_size // cores_per_replica)
+    print('train_batch_size =', train_batch_size)
+    train_dataset = load_tfrecord_dataset(f"data/{params['train_set']}", batch_size=train_batch_size, seq_len=params['seq'])
 
     global_val_batch = per_replica_batch * tpu_size // cores_per_replica
 
@@ -246,7 +251,7 @@ if __name__ == "__main__":
 
     for k, v in params["val_set"].items():
         val_sets[k] = TFRecordNewInputs(
-            f"data/{v}", batch_size=(global_val_batch,), sample_size=seq
+            f"data/{v}", batch_size=(global_val_batch,), sample_size=seq  # XDC: val bsz is different from train bsz!
         )
 
     # tok/sec metrics
@@ -254,7 +259,7 @@ if __name__ == "__main__":
     tokens_per_step = params['seq'] * sequences_per_step
 
     # load + run
-    with jax.experimental.maps.mesh(devices, ('dp', 'mp')):
+    with jax.experimental.maps.Mesh(devices, ('dp', 'mp')):  # XD: mesh -> Mesh
         print("initializing network")
         network = CausalTransformer(params)
 
@@ -278,30 +283,33 @@ if __name__ == "__main__":
         print('compiling train fn')
         start = time.time()
         loss, last_loss, grad_norm, grad_norm_micro = train_step(
-            network, train_dataset.get_samples()
+            # network, train_dataset.get_samples()  # XD
+            network, next(train_dataset)
         )
         step += 1
         print(f"Train fn compiled in {time.time() - start:.06}s")
 
-        print('compiling eval fn')
-        start = time.time()
-        for val_set in val_sets.values():
-            eval_step(network, val_set.get_samples())
-            val_set.reset()
-        print(f"Eval fn compiled in {time.time() - start:.06}s")
+        # print('compiling eval fn')  # XD
+        # start = time.time()
+        # for val_set in val_sets.values():
+        #     eval_step(network, val_set.get_samples())
+        #     val_set.reset()
+        # print(f"Eval fn compiled in {time.time() - start:.06}s")
 
-        project = params.get("wandb_project", "mesh-transformer-jax")
-        wandb.init(project=project, name=params["name"], config=params)
+        # project = params.get("wandb_project", "mesh-transformer-jax")  # XD
+        # wandb.init(project=project, name=params["name"], config=params)
+        wandb = None
 
         G_noise_avg = None
         S_noise_avg = None
 
         while True:
-            if (step % ckpt_every == 1) or step == total_steps:
+            if (step > 1 and step % ckpt_every == 1) or step == total_steps:  # XD: add step > 1
                 print(f"saving a checkpoint for step {step}")
                 save(network, step, bucket, model_dir,
                      mp=cores_per_replica,
-                     aux={"train_loader": train_dataset.get_state()},
+                    #  aux={"train_loader": train_dataset.get_state()},  # XD
+                     aux={"train_loader": next(train_dataset)},
                      delete_old=True,
                      )
 
@@ -317,7 +325,7 @@ if __name__ == "__main__":
                     val_loss = np.array(val_loss).mean()
                     print(f"validation loss for step {step}, set {name}: {val_loss}")
 
-                    wandb.log({f'val/loss_{name}': float(val_loss)}, step)
+                    if wandb is not None: wandb.log({f'val/loss_{name}': float(val_loss)}, step)  # XD
 
             if step == total_steps:
                 print("training completed!")
@@ -325,7 +333,8 @@ if __name__ == "__main__":
 
             start = time.time()
             loss, last_loss, grad_norm, grad_norm_micro = train_step(
-                network, train_dataset.get_samples()
+                # network, train_dataset.get_samples()  # XD
+                network, next(train_dataset)
             )
             step += 1
 
@@ -360,7 +369,7 @@ if __name__ == "__main__":
 
             # heuristic to avoid reporting G_noise in very early training when gradients are large
             # (these take a long time to wash out of the moving average that defines B_simple)
-            use_step_in_noise_avgs = gbbig < 2
+            use_step_in_noise_avgs = False # gbbig < 2  # XD
 
             if use_step_in_noise_avgs:
                 # compute moving averages of G_noise and S_noise, for B_simple
@@ -394,6 +403,7 @@ if __name__ == "__main__":
                 "sequences_processed": sequences_processed,
                 "tokens_processed": tokens_processed,
             }
+            print(wandb_stats); continue  # XD
             wandb_stats.update(noise_scale_stats)
 
             wandb.log(wandb_stats, step)

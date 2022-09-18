@@ -5,6 +5,8 @@ import numpy as np
 from einops import rearrange, repeat
 
 from mesh_transformer.util import f_psum, g_psum, maybe_shard, head_print
+# f_psum, g_psum = lambda x: x, lambda x: x#, lambda x, y: x  # XD
+maybe_shard = lambda x, y: x  # XD
 from jax.experimental import PartitionSpec as P
 from jax.experimental.maps import thread_resources
 
@@ -149,8 +151,8 @@ def apply_rotary_pos_emb(x, sincos):
 
 
 def rotate_every_two_v2(x):
-    x1 = x[:, :, :, ::2]
-    x2 = x[:, :, :, 1::2]
+    x1 = x[..., ::2]  # XD: [:, :, :, -> [...,
+    x2 = x[..., 1::2]
 
     x = jnp.stack((-x2, x1), axis=-1)
 
@@ -219,9 +221,7 @@ class EmbeddingShardV2(hk.Module):
     def __call__(self, x, dtype=jnp.bfloat16):
         input_onehot = jax.nn.one_hot(x, self.in_dim)
         input_onehot = maybe_shard(input_onehot, P("dp", None, "mp"))
-
         proj_out = self.proj(input_onehot)
-
         return proj_out
 
 
@@ -246,28 +246,28 @@ class TransformerLayerShard(hk.Module):
 
         self.norm = norm
 
-        self.q = hk.Linear(self.dim_per_shard, with_bias=False)
-        self.v = hk.Linear(self.dim_per_shard, with_bias=False)
-        self.k = hk.Linear(self.dim_per_shard, with_bias=False)
+        self.q = hk.Linear(self.dim_per_shard, with_bias=False, name='q_proj') # XD: add name
+        self.v = hk.Linear(self.dim_per_shard, with_bias=False, name='v_proj')
+        self.k = hk.Linear(self.dim_per_shard, with_bias=False, name='k_proj')
 
-        self.o = hk.Linear(self.dim, with_bias=False,
+        self.o = hk.Linear(self.dim, with_bias=False, name='o_proj',  # XD: add name
                            w_init=hk.initializers.TruncatedNormal(stddev=init_scale / np.sqrt(self.dim)))
 
-        self.dense_proj = hk.Linear(self.dim_per_shard * 4)
-        self.dense_proj_o = hk.Linear(self.dim,
+        self.dense_proj = hk.Linear(self.dim_per_shard * 4, name='fc_in')
+        self.dense_proj_o = hk.Linear(self.dim, name='fc_out',
                                       w_init=hk.initializers.TruncatedNormal(stddev=init_scale / np.sqrt(self.dim)))
 
     def self_attn(self, q, v, k, attn_bias):
         if self.is_rotary:
-            k_rot = k[:, :, :self.pe_rotary_dims]
-            k_pass = k[:, :, self.pe_rotary_dims:]
+            k_rot = k[..., :self.pe_rotary_dims]  # XD: [:, :, :xx] -> [..., :xx]
+            k_pass = k[..., self.pe_rotary_dims:]
 
-            q_rot = q[:, :, :self.pe_rotary_dims]
-            q_pass = q[:, :, self.pe_rotary_dims:]
+            q_rot = q[..., :self.pe_rotary_dims]
+            q_pass = q[..., self.pe_rotary_dims:]
 
             sincos = fixed_pos_embedding(k_rot)
-            q_rot = apply_rotary_pos_emb(q_rot, sincos)
-            k_rot = apply_rotary_pos_emb(k_rot, sincos)
+            q_rot = apply_rotary_pos_emb_v2(q_rot, sincos)  # XD: -> v2, which is compatible with v1
+            k_rot = apply_rotary_pos_emb_v2(k_rot, sincos)  # XD: -> v2, which is compatible with v1
 
             k = jnp.concatenate([k_rot, k_pass], axis=-1)
             q = jnp.concatenate([q_rot, q_pass], axis=-1)
@@ -366,6 +366,87 @@ class TransformerLayerShard(hk.Module):
         return g_psum(attn_out + dense_out), {"k": k, "v": v, "tokens_decoded": given_length.astype(jnp.uint32)}
 
 
+class TransformerLayerShardV1(hk.Module):  # XD
+    def __init__(self, config, name=None, init_scale=1.):
+        super().__init__(name=name)
+        self.dim = config["d_model"]
+        self.n_head = config["n_heads"]
+        self.d_head = config["d_head"]
+        self.d_rotary = config["pe_rotary_dims"]
+        # self.mp_num = thread_resources.env.shape['mp']
+
+        self.norm = hk.LayerNorm(-1, True, True)
+        self.qkv_proj = hk.Linear(self.d_head * self.n_head * 3, with_bias=False, name='qkv_proj')
+        self.o_proj = hk.Linear(self.d_head * self.n_head, with_bias=False, name='o_proj')
+        
+        self.fc_in = hk.Linear(self.dim * 4, name='fc_in')
+        self.fc_out = hk.Linear(self.dim, name='fc_out',
+                                w_init=hk.initializers.TruncatedNormal(stddev=init_scale / np.sqrt(self.dim)))
+
+    def self_attn(self, q, v, k, attn_bias):
+        k_rot = k[:, :, :, :self.d_rotary]
+        k_pass = k[:, :, :, self.d_rotary:]
+
+        q_rot = q[:, :, :, :self.d_rotary]
+        q_pass = q[:, :, :, self.d_rotary:]
+
+        sincos = fixed_pos_embedding(k_rot, seq_dim=1)
+        q_rot = apply_rotary_pos_emb_v2(q_rot, sincos)
+        k_rot = apply_rotary_pos_emb_v2(k_rot, sincos)
+        q_rot = maybe_shard(q_rot, P("dp", None, "mp", None))
+        k_rot = maybe_shard(k_rot, P("dp", None, "mp", None))
+
+        k = jnp.concatenate([k_rot, k_pass], axis=-1)
+        q = jnp.concatenate([q_rot, q_pass], axis=-1)
+
+        k = maybe_shard(k, P("dp", None, "mp", None))
+        q = maybe_shard(q, P("dp", None, "mp", None))
+
+        attention_logits = jnp.einsum("bthd,bThd->bhtT", q, k)
+
+        attention_logits = maybe_shard(attention_logits, P("dp", "mp", None, None))
+
+        sqrt_key_size = np.sqrt(self.d_head).astype(k.dtype)
+        attention_logits = attention_logits / sqrt_key_size
+
+        attention_logits += attn_bias
+        attention_logits = maybe_shard(attention_logits, P("dp", "mp", None, None))
+
+        attention_weights = jax.nn.softmax(attention_logits)
+        attention_weights = maybe_shard(attention_weights, P("dp", "mp", None, None))
+
+        attention_vec = jnp.einsum("bhtT,bThd->bthd", attention_weights, v)
+        attention_vec = attention_vec.reshape(attention_vec.shape[:2] + (-1,)) # bind->bie
+
+        # attention_vec = maybe_shard(attention_vec, P("dp", None, "mp", None))
+        # sharded_attn_vec = attention_vec.reshape(attention_vec.shape[:2] + (self.mp_num, self.n_head//self.mp_num, -1))  # XDC: bind->bip(n/p)d
+        # sharded_attn_vec = maybe_shard(sharded_attn_vec, P("dp", None, "mp", None, None))
+
+        # attention_vec = attention_vec.reshape(sharded_attn_vec.shape[:2] + (self.mp_num, -1))  # XDC: bip(n/p)d->bip(n/p*d)
+        # return maybe_shard(attention_vec, P("dp", None, "mp", None))
+        return self.o_proj(attention_vec)
+
+    def ff(self, x):
+        x = self.fc_in(x)
+        x = jax.nn.gelu(x)
+        return self.fc_out(x)
+
+    def __call__(self, x, attn_bias):
+        x = self.norm(x)
+        qkv = self.qkv_proj(x)  # bi(n3d)
+        qkv = qkv.reshape(qkv.shape[:-1] + (self.n_head, -1))  # bin(3d)
+        q, v, k = jnp.split(qkv, [self.d_head, self.d_head * 2], axis=-1)  # bind
+
+        seq_len = x.shape[1]
+        causal_mask = np.tril(np.ones((seq_len, seq_len)))#[None, :, :]
+        bias = -1e10 * (1. - causal_mask)
+        bias += attn_bias
+
+        attn_out = self.self_attn(q, v, k, bias)
+        ff_out = self.ff(x)
+        return attn_out + ff_out
+
+
 # This new class combines the input and output projection into one matmul for better efficiency
 class TransformerLayerShardV2(hk.Module):
     def __init__(self, config, name=None, init_scale=1.):
@@ -377,8 +458,8 @@ class TransformerLayerShardV2(hk.Module):
         self.mp_num = thread_resources.env.shape['mp']
 
         self.norm = hk.LayerNorm(-1, True, True)
-        self.input_proj = hk.Linear(self.d_head * self.n_head * 3 + self.dim * 8)
-        self.output_proj = hk.Linear(self.dim,
+        self.input_proj = hk.Linear(self.d_head * self.n_head * 3 + self.dim * 8, name='qkv_proj+fn_in')
+        self.output_proj = hk.Linear(self.dim, name='o_proj+fn_out',
                                      w_init=hk.initializers.TruncatedNormal(stddev=init_scale / jnp.sqrt(self.dim)))
 
     def self_attn(self, q, v, k, attn_bias):
@@ -416,17 +497,17 @@ class TransformerLayerShardV2(hk.Module):
         attention_vec = jnp.einsum("bhtT,bThd->bthd", attention_weights, v)
 
         attention_vec = maybe_shard(attention_vec, P("dp", None, "mp", None))
-        sharded_attn_vec = attention_vec.reshape(attention_vec.shape[:2] + (self.mp_num, self.n_head//self.mp_num, -1))
+        sharded_attn_vec = attention_vec.reshape(attention_vec.shape[:2] + (self.mp_num, self.n_head//self.mp_num, -1))  # XDC: bind->bip(n/p)d
         sharded_attn_vec = maybe_shard(sharded_attn_vec, P("dp", None, "mp", None, None))
 
-        attention_vec = attention_vec.reshape(sharded_attn_vec.shape[:2] + (self.mp_num, -1))
+        attention_vec = attention_vec.reshape(sharded_attn_vec.shape[:2] + (self.mp_num, -1))  # XDC: bip(n/p)d->bip(n/p*d)
         return maybe_shard(attention_vec, P("dp", None, "mp", None))
 
-    # input: [batch, seq, dim]
+    # input: [batch, seq, dim]  # XDC: wrong
     # output: [batch, seq, n_head, d_head]
     def head_split(self, x):
-        reshaped = x.reshape(x.shape[:-1] + (self.n_head//self.mp_num, self.d_head))
-        reshaped = reshaped.reshape(x.shape[:-2] + (-1, ) + x.shape[-1:])
+        reshaped = x.reshape(x.shape[:-1] + (self.n_head//self.mp_num, self.d_head))  # XDC: bip(n/p*d)->bip(n/p)d
+        reshaped = reshaped.reshape(x.shape[:-2] + (-1, ) + x.shape[-1:])  # XDC: bip(n/p)d->bind
 
         # return reshaped
         return maybe_shard(reshaped, P("dp", None, "mp", None))
@@ -451,10 +532,10 @@ class TransformerLayerShardV2(hk.Module):
         return q, v, k, ff
 
     def output(self, *x):
-        out = jnp.concatenate(x, axis=-1)
+        out = jnp.concatenate(x, axis=-1)  # XDC: bip(n/p*d),bip(f/p)->bip(n/p*d+f/p)
         out = maybe_shard(out, P("dp", None, "mp", None))
 
-        out = out.reshape(x[0].shape[:-2] + (-1,))
+        out = out.reshape(x[0].shape[:-2] + (-1,))  # XDC: bip(n/p*d+f/p)->bi(n*d+f)
         out_shard = maybe_shard(out, P("dp", None, "mp"))
 
         return self.output_proj(out_shard)
@@ -476,8 +557,8 @@ class TransformerLayerShardV2(hk.Module):
 
         bias += attn_bias
 
-        attn_out = self.self_attn(q, v, k, bias)
-        ff_out = self.glu(ff)
+        attn_out = self.self_attn(q, v, k, bias)  # XDC: bip(n/p*d)
+        ff_out = self.glu(ff)  # XDC: bip(f/p)
 
         return self.output(attn_out, ff_out)
 
@@ -485,7 +566,7 @@ class TransformerLayerShardV2(hk.Module):
     def glu(self, x):
         out, gate = jnp.split(x, 2, axis=-1)
 
-        return out * jax.nn.gelu(gate)
+        return out * jax.nn.gelu(gate)  # XDC: bip(f/p)
 
     # iterate the decoding process by a single token
     def decode_once(self, decode_state, x, attn_bias):

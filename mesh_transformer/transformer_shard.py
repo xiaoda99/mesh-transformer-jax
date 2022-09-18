@@ -13,8 +13,8 @@ from jax.experimental.pjit import pjit
 
 from mesh_transformer.checkpoint import read_ckpt, write_ckpt, write_ckpt_v2, load_ckpt_v2
 from mesh_transformer.layers import EmbeddingShard, TransformerLayerShard, RelativePositionEmbs, ProjectionShard, \
-    TransformerLayerShardV2, Projection, EmbeddingShardV2
-from mesh_transformer.util import to_f32, to_bf16, maybe_shard, head_print, global_norm
+    TransformerLayerShardV1, TransformerLayerShardV2, Projection, EmbeddingShardV2
+from mesh_transformer.util import to_f32, to_bf16, maybe_shard, head_print, global_norm, Timer  # XD
 from jax.experimental import PartitionSpec as P
 
 
@@ -24,28 +24,30 @@ class CausalTransformerShard(hk.Module):
         heads = config["n_heads"]
         shards = config["cores_per_replica"]
         layer_count = config["layers"]
+        self.use_pjit = config["norm"] == 'layernorm-desync'
 
         self.transformer_layers = []
         self.heads = heads
 
         self.heads_per_shard = heads // shards
 
-        self.embed = EmbeddingShard(config)
+        self.embed = EmbeddingShardV2(config) if self.use_pjit else EmbeddingShard(config) # XD
 
-        init_scale = 2. / layer_count
+        init_scale = 2. / max(1, layer_count)
 
         for i in range(layer_count):
-            self.transformer_layers.append(TransformerLayerShard(config, name=f"layer_{i}", init_scale=init_scale))
+            layer_cls = TransformerLayerShardV1 if self.use_pjit else TransformerLayerShard  # XD
+            self.transformer_layers.append(layer_cls(config, name=f"layer_{i}", init_scale=init_scale))  # XD
 
-        self.proj = ProjectionShard(config)
+        self.proj = Projection(config) if self.use_pjit else ProjectionShard(config)  # XD
 
         if config["pe"] == "t5":
             self.rpe = RelativePositionEmbs()
         else:
             self.rpe = None
 
-    def eval(self, context, target, z_loss=0., mask=0.0):
-        input_len = context.shape[0]
+    def eval(self, context, target, z_loss=0., mask=0.0):  # XDC: why not merge into loss?
+        input_len = context.shape[0]  # XD: 0->1
 
         if self.rpe is not None:
             attn_bias = self.rpe(input_len, input_len, self.heads_per_shard, 32)
@@ -54,12 +56,20 @@ class CausalTransformerShard(hk.Module):
 
         attn_bias += mask
 
-        x = hk.remat(self.embed)(context)
+        # x = hk.remat(self.embed)(context)
+
+        # for l in self.transformer_layers:
+        #     x = x + hk.remat(l)(x, attn_bias)
+
+        # return hk.remat(self.proj.loss)(x, target, z_loss)
+        
+        # XD: remove remat
+        x = self.embed(context)
 
         for l in self.transformer_layers:
-            x = x + hk.remat(l)(x, attn_bias)
+            x = x + l(x, attn_bias)
 
-        return hk.remat(self.proj.loss)(x, target, z_loss)
+        return self.proj.loss(x, target, z_loss)
 
     def loss(self, ctx, tgt, z_loss=False, mask=0.0):
         loss, correct = self.eval(ctx, tgt, float(z_loss), mask=mask)
@@ -127,7 +137,10 @@ class CausalTransformer:
 
             eval_loss_fn = hk.without_apply_rng(hk.transform(eval_loss)).apply
 
-            mask = (jnp.arange(0, len(ctx)) > ctx_length) * -1e10
+            # mask = (jnp.arange(0, len(ctx)) > ctx_length) * -1e10  # XD: j
+            # XD: copied from V2
+            mask = (jnp.arange(0, ctx.shape[1])[None, :] > ctx_length[:, None]) * -1e10  # XD: bj
+            mask = mask[:, None, None, :]  # XD: bj->bnij
 
             return eval_loss_fn(to_bf16(state["params"]), ctx, tgt, mask)
 
@@ -162,7 +175,7 @@ class CausalTransformer:
 
             grad_norm_micro = jax.lax.pmean(gnorm, "batch")
 
-            grad = jax.lax.pmean(grad, "batch")
+            grad = jax.lax.pmean(grad, "batch") # XDC: loss and last_loss are not pmeaned accross batch dim
             grad_norm = global_norm(grad)
             updates, new_opt_state = optimizer.update(grad, state["opt_state"], state["params"])
 
@@ -251,7 +264,9 @@ class CausalTransformer:
                                                     in_axes=(["shard", ...], ["batch", ...]),
                                                     out_axes=["shard", ...],
                                                     axis_resources={'shard': 'mp', 'batch': 'dp'})
+        with Timer('init_state'): self.init_state(self.config)  # XD
 
+    def init_state(self, config):  # XD
         key = hk.PRNGSequence(42)
 
         assert thread_resources.env.shape['mp'] == config["cores_per_replica"]
@@ -341,7 +356,7 @@ class CausalTransformer:
 
 # this bypasses the CausalTransformerShard class (which causes ugly code) but in return allows layers to be processed
 # by a `jax.scan`, which allows for much faster and O(1) compile times w.r.t. layers.
-class CausalTransformerV2:
+class CausalTransformerV2:  # XDC: do not have a seperate model class like CausalTransformerShard
     def __init__(self, config):
         self.config = config
         optimizer = config["optimizer"]
@@ -473,6 +488,7 @@ class CausalTransformerV2:
             # zero level 1: shard optimizer states over both MP and DP
             state_shard["opt_state"] = jax.tree_map(partial(shard_strategy, parallel=["mp", "dp"]), param_shapes["opt_state"])
 
+        self.param_shape = param_shapes  # XD
         self.state_shard = state_shard
 
         head_print("sharding strategy:")
