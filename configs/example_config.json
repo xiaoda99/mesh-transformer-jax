@@ -1,17 +1,18 @@
 {
-  "layers": 1,
+  "transformation": "xmap",
+  "layers": 2,
   "d_model": 32,
   "n_heads": 8,
   "d_head": 4,
   "n_vocab": 64,
-  "norm": "layernorm-desync",
+  "norm": "layernorm",
   "pe": "rotary",
   "pe_rotary_dims": 2,
 
-  "seq": 8,
+  "seq": 1024,
   "cores_per_replica": 8,
-  "per_replica_batch": 1,
-  "gradient_accumulation_steps": 16,
+  "per_replica_batch": 8,
+  "gradient_accumulation_steps": 2,
 
   "warmup_steps": 7,
   "anneal_steps": 65,
@@ -25,7 +26,7 @@
   "bucket": "your-bucket",
   "model_dir": "finetune_dir",
 
-  "train_set": "example.train.index",
+  "train_set": "rotten_tomatoes_train_8530.tfrecords",
   "val_set": {},
 
   "eval_harness_tasks": [

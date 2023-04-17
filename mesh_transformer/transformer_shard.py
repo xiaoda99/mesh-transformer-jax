@@ -14,7 +14,7 @@ from jax.experimental.pjit import pjit
 from mesh_transformer.checkpoint import read_ckpt, write_ckpt, write_ckpt_v2, load_ckpt_v2
 from mesh_transformer.layers import EmbeddingShard, TransformerLayerShard, RelativePositionEmbs, ProjectionShard, \
     TransformerLayerShardV1, TransformerLayerShardV2, Projection, EmbeddingShardV2
-from mesh_transformer.util import to_f32, to_bf16, maybe_shard, head_print, global_norm, Timer  # XD
+from mesh_transformer.util import to_f32, to_bf16, maybe_shard, head_print, global_norm
 from jax.experimental import PartitionSpec as P
 
 
@@ -24,22 +24,20 @@ class CausalTransformerShard(hk.Module):
         heads = config["n_heads"]
         shards = config["cores_per_replica"]
         layer_count = config["layers"]
-        self.use_pjit = config["norm"] == 'layernorm-desync'
 
         self.transformer_layers = []
         self.heads = heads
 
         self.heads_per_shard = heads // shards
 
-        self.embed = EmbeddingShardV2(config) if self.use_pjit else EmbeddingShard(config) # XD
+        self.embed = EmbeddingShard(config)
 
         init_scale = 2. / max(1, layer_count)
 
         for i in range(layer_count):
-            layer_cls = TransformerLayerShardV1 if self.use_pjit else TransformerLayerShard  # XD
-            self.transformer_layers.append(layer_cls(config, name=f"layer_{i}", init_scale=init_scale))  # XD
+            self.transformer_layers.append(TransformerLayerShard(config, name=f"layer_{i}", init_scale=init_scale))
 
-        self.proj = Projection(config) if self.use_pjit else ProjectionShard(config)  # XD
+        self.proj = ProjectionShard(config)
 
         if config["pe"] == "t5":
             self.rpe = RelativePositionEmbs()
@@ -124,11 +122,26 @@ class CausalTransformerShard(hk.Module):
 
         return self.proj(x), new_states
 
+def param_shapes_to_shard(param_shapes, parallel, config=None):  # XD
+    from copy import deepcopy
+    params_shard = deepcopy(param_shapes)
+    for name, d in params_shard.items():
+        for k, shape_dtype in d.items():
+            assert shape_dtype.ndim in [1, 2]
+            if shape_dtype.ndim == 1:  # linear.bias, layernorm.weight/bias
+                d[k] = P(parallel) if name.endswith('/fc_in') else P(None)  # mlp_in bias is sharded
+            elif any(name.endswith(s) for s in ['/projection_shard/~/linear', '/fc_in', 'q_proj', 'k_proj', 'v_proj']):
+                d[k] = P(None, parallel)   # assert shape_dtype.shape[0] == config["d_model"]
+            elif any(name.endswith(s) for s in ['/embedding_shard/~/linear', '/fc_out', 'o_proj']):
+                d[k] = P(parallel, None)   # assert shape_dtype.shape[1] == config["d_model"]
+            else: assert False
+    return params_shard
 
 class CausalTransformer:
     def __init__(self, config):
         self.config = config
         optimizer = config["optimizer"]
+        self.transformation = config.get('transformation', 'xmap')  # XD
 
         def eval(state, ctx, tgt, ctx_length):
             def eval_loss(x, y, mask):
@@ -145,6 +158,9 @@ class CausalTransformer:
             return eval_loss_fn(to_bf16(state["params"]), ctx, tgt, mask)
 
         def train(state, ctx, tgt):
+            # XDC: state shape: [1]e'e' for xmap, ee for pjit
+            # ctx/tgt shape :[B]gi for xmap, gBi for pjit, [dp]gbi for pmap
+            # where [.] is "invisible" axis, g = grad_accum, B = dp*b
             def train_loss(x, y):
                 transformer = CausalTransformerShard(config)
                 out = transformer.loss(x, y, z_loss=True)
@@ -160,26 +176,25 @@ class CausalTransformer:
                 (loss, last_loss), grad = val_grad_fn(to_bf16(state["params"]), ctx, tgt)
 
                 new_grad = jax.tree_multimap(lambda a, b: a + b, old_grad, grad)
-                gnorm = global_norm(grad)
-                return new_grad, (loss, last_loss, gnorm)
+                # gnorm = global_norm(grad)  # XDD
+                return new_grad, (loss, last_loss)#, gnorm)  # XD: remove gnorm
 
             if ctx.shape[0] == 1:
                 val_grad_fn = jax.value_and_grad(train_loss_fn, has_aux=True)
                 (loss, last_loss), grad = val_grad_fn(to_bf16(state["params"]), ctx[0], tgt[0])
-                gnorm = global_norm(grad)
+                # gnorm = global_norm(grad)  # XDD
             else:
-                grad, (loss, last_loss, gnorm) = jax.lax.scan(microbatch,
+                grad, (loss, last_loss) = jax.lax.scan(microbatch,  # XD: remove gnorm
                                                        jax.tree_map(lambda x: jnp.zeros_like(x).astype(jnp.bfloat16),
                                                                     state["params"]),
                                                        (ctx, tgt))
 
-            grad_norm_micro = jax.lax.pmean(gnorm, "batch")
-
-            grad = jax.lax.pmean(grad, "batch") # XDC: loss and last_loss are not pmeaned accross batch dim
-            grad_norm = global_norm(grad)
+            # grad_norm_micro = jax.lax.pmean(gnorm, "batch")
+            if self.transformation == 'xmap': grad = jax.lax.pmean(grad, "batch") # XD: add if. loss and last_loss are not pmeaned accross batch dim
+            # grad_norm = global_norm(grad)
             updates, new_opt_state = optimizer.update(grad, state["opt_state"], state["params"])
 
-            return to_f32(loss), to_f32(last_loss), to_f32(grad_norm), to_f32(grad_norm_micro), {
+            return to_f32(loss), to_f32(last_loss), { # to_f32(grad_norm), to_f32(grad_norm_micro), {
                 "params": optax.apply_updates(state["params"], to_f32(updates)),
                 "step": state["step"] + 1,
                 "opt_state": new_opt_state
@@ -191,9 +206,7 @@ class CausalTransformer:
                 return transformer.loss(x, y)
 
             param_init_fn = hk.transform(hk.experimental.optimize_rng_use(train_loss)).init
-
             params = param_init_fn(key, x, x)
-
             return {
                 "params": ("early_cast" in config and to_bf16 or to_f32)(params),
                 "step": np.array(0),
@@ -228,69 +241,94 @@ class CausalTransformer:
             generate_fn = hk.transform(generate_sample).apply
             return generate_fn(state["params"], key, ctx, ctx_length, aux)
 
-        self.init_xmap = jax.experimental.maps.xmap(fun=init,
-                                                    in_axes=(["shard", ...],
-                                                             ["batch", ...]),
-                                                    out_axes=["shard", ...],
-                                                    axis_resources={'shard': 'mp', 'batch': 'dp'})
-
-        self.eval_xmap = jax.experimental.maps.xmap(fun=eval,
-                                                    in_axes=(["shard", ...],
-                                                             ["batch", ...],
-                                                             ["batch", ...],
-                                                             ["batch", ...]),
-                                                    out_axes=["batch", ...],
-                                                    axis_resources={'shard': 'mp', 'batch': 'dp'})
-
-        self.train_xmap = jax.experimental.maps.xmap(fun=train,
-                                                     in_axes=(["shard", ...],
-                                                              ["batch", ...],
-                                                              ["batch", ...]),
-                                                     out_axes=(["batch", ...], ["batch", ...], ["batch", ...], ["batch", ...], ["shard", ...]),
-                                                     donate_argnums=(0,),
-                                                     axis_resources={'shard': 'mp', 'batch': 'dp'})
-
-        self.generate_xmap = jax.experimental.maps.xmap(fun=generate,
+        if self.transformation == 'xmap':  # XD:  add if else and self.xxx_
+            self.init_ = self.init_xmap = jax.experimental.maps.xmap(fun=init,
                                                         in_axes=(["shard", ...],
-                                                                 ["batch", ...],
-                                                                 ["batch", ...],
-                                                                 ["batch", ...],
-                                                                 ["batch", ...],
-                                                                 ["batch", ...]),
+                                                                ["batch", ...]),
+                                                        out_axes=["shard", ...],
+                                                        axis_resources={'shard': 'mp', 'batch': 'dp'})
+
+            self.eval_ = self.eval_xmap = jax.experimental.maps.xmap(fun=eval,
+                                                        in_axes=(["shard", ...],
+                                                                ["batch", ...],
+                                                                ["batch", ...],
+                                                                ["batch", ...]),
                                                         out_axes=["batch", ...],
                                                         axis_resources={'shard': 'mp', 'batch': 'dp'})
 
-        self.move_xmap = jax.experimental.maps.xmap(fun=lambda x, _: to_bf16(x),
-                                                    in_axes=(["shard", ...], ["batch", ...]),
-                                                    out_axes=["shard", ...],
-                                                    axis_resources={'shard': 'mp', 'batch': 'dp'})
-        with Timer('init_state'): self.init_state(self.config)  # XD
+            self.train_ = self.train_xmap = jax.experimental.maps.xmap(fun=train,
+                                                        in_axes=(["shard", ...],
+                                                                ["batch", ...],
+                                                                ["batch", ...]),
+                                                        out_axes=(["batch", ...], ["batch", ...], ["shard", ...]),  # XD: remove ["batch", ...], ["batch", ...]
+                                                        donate_argnums=(0,),
+                                                        axis_resources={'shard': 'mp', 'batch': 'dp'})
+
+            self.generate_xmap = jax.experimental.maps.xmap(fun=generate,
+                                                            in_axes=(["shard", ...],
+                                                                    ["batch", ...],
+                                                                    ["batch", ...],
+                                                                    ["batch", ...],
+                                                                    ["batch", ...],
+                                                                    ["batch", ...]),
+                                                            out_axes=["batch", ...],
+                                                            axis_resources={'shard': 'mp', 'batch': 'dp'})
+
+            self.move_xmap = jax.experimental.maps.xmap(fun=lambda x, _: to_bf16(x),
+                                                        in_axes=(["shard", ...], ["batch", ...]),
+                                                        out_axes=["shard", ...],
+                                                        axis_resources={'shard': 'mp', 'batch': 'dp'})
+        elif self.transformation == 'pjit':  # XD: adapted from CausalTransformerV2.__init__
+            x = jnp.zeros((1, 4)).astype(jnp.uint32).astype(jnp.uint32)  # batch, seq
+            state_shapes = jax.eval_shape(init, jax.random.PRNGKey(42), x)
+            param_shard = param_shapes_to_shard(state_shapes['params'], parallel='mp')
+
+            # ref get_opt_spec in run_clm_mp.py (xd/few-shot) and shard_strategy in CausalTransformerV2
+            def get_state_shard(x):
+                if isinstance(x, dict): return param_shard
+                if isinstance(x, jax.ShapeDtypeStruct): assert x.shape == (); return P()
+                return None
+
+            state_shard = jax.tree_map(get_state_shard, state_shapes, 
+                is_leaf=lambda x: isinstance(x, dict) and 'params' not in x  # not top-level dict
+                # or isinstance(x, optax.EmptyState)
+                # CausalTransformerV2 leaves EmptyStates untouched, unlike get_opt_spec which maps them to None
+            )
+
+            self.init_ = self.init_pjit = pjit(init,
+                            in_axis_resources=(None, P("dp")),
+                            out_axis_resources=state_shard)
+
+            self.eval_ = self.eval_pjit = pjit(eval,
+                            in_axis_resources=(state_shard["params"], P("dp"), P("dp"), P("dp")),
+                            out_axis_resources=P("dp"))
+
+            self.train_ = self.train_pjit = pjit(train,
+                            in_axis_resources=(state_shard, P(None, "dp"), P(None, "dp")),
+                            out_axis_resources=(None, None, state_shard),
+                            donate_argnums=(0,))
+        self.init_state(self.config)  # XD
 
     def init_state(self, config):  # XD
         key = hk.PRNGSequence(42)
-
         assert thread_resources.env.shape['mp'] == config["cores_per_replica"]
-
         dp = thread_resources.env.shape['dp']
         mp = thread_resources.env.shape['mp']
-
         mp_per_host = min(mp, 8)
-
         seq = config["seq"]
         vocab = config["n_vocab"]
 
         example_shape = (max(dp // jax.host_count(), 1), seq,)
         x = jax.random.uniform(next(key), example_shape, minval=0, maxval=vocab).astype(jnp.uint32)  # batch, len
 
-        head_print("key shape", jnp.array(key.take(mp_per_host)).shape)
+        _key = jnp.array(key.take(mp_per_host)) if self.transformation == 'xmap' else next(key)  # XD
+        head_print("key shape", _key.shape)  # XD: jnp.array(key.take(mp_per_host)) -> _key
         head_print("in shape", x.shape)
-
         head_print("dp", dp)
         head_print("mp", mp)
 
         self.gen_length = 1
-        self.state = self.init_xmap(jnp.array(key.take(mp_per_host)), x)
-
+        self.state = self.init_(_key, x)  # XD init_xmap -> init_, jnp.array(key.take(mp_per_host)) -> _key
         param_count = hk.data_structures.tree_size(self.state['params'])
         head_print(f"Total parameters: {param_count}")
 
@@ -301,41 +339,28 @@ class CausalTransformer:
         self.state = read_ckpt(self.state, path, thread_resources.env.shape['mp'])
 
     def train(self, sample):
-        # print("train iter")
-        # print("sample", sample["obs"])
-        # print("target", sample["target"])
-        obs = jnp.transpose(sample["obs"], (1, 0, 2))
-        target = jnp.transpose(sample["target"], (1, 0, 2))
+        obs, target = sample["obs"], sample["target"]
+        if self.transformation == 'xmap':  # XDC: grad_accum,bs->bs,grad_accum for xmap
+            obs = jnp.transpose(sample["obs"], (1, 0, 2))
+            target = jnp.transpose(sample["target"], (1, 0, 2))
 
-        # print("train sample", obs.shape)
-        # print("train target", target.shape)
-
-        # assert (sample["obs"][:, 1:] == sample["target"][:, -1])
-
-        # start = time.time()
-        loss, last_loss, grad_norm, grad_norm_micro, self.state = self.train_xmap(self.state, obs, target)
+        # loss, last_loss, grad_norm, grad_norm_micro, self.state = self.train_xmap(self.state, obs, target)
+        loss, last_loss, self.state = self.train_(self.state, obs, target)  # XD
         loss = np.array(loss)
         last_loss = np.array(last_loss)
-        grad_norm = np.array(grad_norm)
-        # print(f"iter done in {time.time() - start:.06}s")
-        return loss.mean(), last_loss.mean(), grad_norm.mean(), grad_norm_micro.mean()
+        # grad_norm = np.array(grad_norm)
+        return loss.mean(), last_loss.mean()#, grad_norm.mean(), grad_norm_micro.mean()
 
     def eval(self, sample):
         # print("eval sample", sample["obs"].shape)
         # print("eval target", sample["target"].shape)
-
-        # start = time.time()
 
         if "ctx_length" in sample:
             ctx_length = sample["ctx_length"]
         else:
             ctx_length = np.array([len(sample["obs"][0])] * len(sample["obs"]))
 
-        out = self.eval_xmap(self.state, sample["obs"], sample["target"], ctx_length)
-        # print(f"eval dispatched in {time.time() - start:.06}s")
-
-        # np.array(out["loss"])
-        # print(f"eval done in {time.time() - start:.06}s")
+        out = self.eval_(self.state, sample["obs"], sample["target"], ctx_length)  # XD: eval_xmap -> eval_
         return out
 
     def generate(self, ctx, ctx_length, gen_length, sampler_options, return_logits=False):

@@ -5,7 +5,6 @@ import numpy as np
 from einops import rearrange, repeat
 
 from mesh_transformer.util import f_psum, g_psum, maybe_shard, head_print
-# f_psum, g_psum = lambda x: x, lambda x: x#, lambda x, y: x  # XD
 maybe_shard = lambda x, y: x  # XD
 from jax.experimental import PartitionSpec as P
 from jax.experimental.maps import thread_resources
@@ -127,7 +126,7 @@ class RelativePositionEmbs(hk.Module):
         return values
 
 
-def fixed_pos_embedding(x, seq_dim=0):
+def fixed_pos_embedding(x, seq_dim=-3):  # XD: 0 -> -3, ...ind
     dim = x.shape[-1]
     inv_freq = 1. / (10000 ** (np.arange(0, dim, 2) / dim))
 
@@ -169,7 +168,8 @@ class EmbeddingShard(hk.Module):
         super().__init__(name=name)
         in_dim = config["n_vocab"]
         out_dim = config["d_model"]
-        shards = config["cores_per_replica"]
+        self.transformation = config.get('transformation', 'xmap')  # XD
+        shards = config["cores_per_replica"] if self.transformation == 'xmap' else 1  # XD: pmap or pjit
 
         assert in_dim % shards == 0
 
@@ -187,12 +187,14 @@ class EmbeddingShard(hk.Module):
         self.proj = hk.Linear(self.out_dim, w_init=hk.initializers.TruncatedNormal(stddev=1 / np.sqrt(in_dim)))
 
     def __call__(self, x, dtype=jnp.bfloat16):
-        shard_start_index = jax.lax.axis_index('shard') * self.in_dim_per_shard
+        shard_start_index = jax.lax.axis_index('shard') * self.in_dim_per_shard \
+            if self.transformation == 'xmap' else 0  # XD
 
         input_onehot = jax.nn.one_hot(x - shard_start_index, self.in_dim_per_shard)
+        input_onehot = maybe_shard(input_onehot, P("dp", None, "mp"))
         proj_out = self.proj(input_onehot)
 
-        proj_out = g_psum(proj_out)
+        if self.transformation == 'xmap': proj_out = g_psum(proj_out)  # XD: add if
 
         if self.positional_embeddings is not None:
             all_pos_embed = jax.lax.all_gather(self.positional_embeddings, 'shard')
@@ -231,9 +233,12 @@ class TransformerLayerShard(hk.Module):
         super().__init__(name=name)
         heads = config["n_heads"]
         dim = config["d_model"]
-        shards = config["cores_per_replica"]
-        norm = getnorm(config["norm"])
+        self.transformation = config.get('transformation', 'xmap')  # XD
+        shards = config["cores_per_replica"] if self.transformation == 'xmap' else 1  # XD: pmap or pjit
+        self.norm = getnorm(config["norm"])
         self.is_rotary = config["pe"] == "rotary"
+        self.concat_qkv = config.get("concat_qkv", False)  # XD
+        self.config = config  # XD
 
         assert dim % heads == 0
         assert heads % shards == 0
@@ -244,11 +249,12 @@ class TransformerLayerShard(hk.Module):
         self.dim_per_shard = dim // shards
         self.pe_rotary_dims = config.get("pe_rotary_dims", self.dim_per_head)
 
-        self.norm = norm
-
-        self.q = hk.Linear(self.dim_per_shard, with_bias=False, name='q_proj') # XD: add name
-        self.v = hk.Linear(self.dim_per_shard, with_bias=False, name='v_proj')
-        self.k = hk.Linear(self.dim_per_shard, with_bias=False, name='k_proj')
+        if self.concat_qkv:  # XD
+            self.qkv_proj = hk.Linear(self.dim_per_shard * 3, with_bias=False, name='qkv_proj')
+        else:
+            self.q = hk.Linear(self.dim_per_shard, with_bias=False, name='q_proj') # XD: add name
+            self.v = hk.Linear(self.dim_per_shard, with_bias=False, name='v_proj')
+            self.k = hk.Linear(self.dim_per_shard, with_bias=False, name='k_proj')
 
         self.o = hk.Linear(self.dim, with_bias=False, name='o_proj',  # XD: add name
                            w_init=hk.initializers.TruncatedNormal(stddev=init_scale / np.sqrt(self.dim)))
@@ -268,21 +274,34 @@ class TransformerLayerShard(hk.Module):
             sincos = fixed_pos_embedding(k_rot)
             q_rot = apply_rotary_pos_emb_v2(q_rot, sincos)  # XD: -> v2, which is compatible with v1
             k_rot = apply_rotary_pos_emb_v2(k_rot, sincos)  # XD: -> v2, which is compatible with v1
+            q_rot = maybe_shard(q_rot, P("dp", None, "mp", None))  # XD: bind' for pjit
+            k_rot = maybe_shard(k_rot, P("dp", None, "mp", None))  # XD: bind' for pjit
 
             k = jnp.concatenate([k_rot, k_pass], axis=-1)
             q = jnp.concatenate([q_rot, q_pass], axis=-1)
+            k = maybe_shard(k, P("dp", None, "mp", None))  # XD: bind for pjit
+            q = maybe_shard(q, P("dp", None, "mp", None))  # XD: bind for pjit
 
-        attention_logits = jnp.einsum("thd,Thd->htT", q, k)
+        # XD: prepend ... (== [b]) to subsume jit (bind), pmap (ind) and pjit (bind)
+        attention_logits = jnp.einsum("...thd,...Thd->...htT", q, k)  # XD: [b]ind,[b]jnd->[b]nij
+        attention_logits = maybe_shard(attention_logits, P("dp", "mp", None, None))  # XD: bnij for pjit
 
         sqrt_key_size = np.sqrt(self.dim_per_head).astype(k.dtype)
         attention_logits = attention_logits / sqrt_key_size
-
         attention_logits += attn_bias
+        attention_logits = maybe_shard(attention_logits, P("dp", "mp", None, None))  # XD: bnij for pjit
 
         attention_weights = jax.nn.softmax(attention_logits)
-        attention_vec = jnp.einsum("htT,Thd->thd", attention_weights, v).reshape((-1, self.dim_per_shard))
+        attention_logits = maybe_shard(attention_logits, P("dp", "mp", None, None))  # XD: bnij for pjit
 
-        return self.o(attention_vec)
+        # attention_vec = jnp.einsum("htT,Thd->thd", attention_weights, v).reshape((-1, self.dim_per_shard))
+        attention_vec = jnp.einsum("...htT,...Thd->...thd", attention_weights, v) # XD: [b]nij,[b]jnd->[b]ind
+        attention_vec = maybe_shard(attention_vec, P("dp", None, "mp", None))  # XD: bind for pjit
+        attention_vec = attention_vec.reshape(attention_vec.shape[:-2] + (-1,))  # XD: [b]ind->[b]i(nd)
+        attention_vec = maybe_shard(attention_vec, P("dp", None, "mp"))  # XD: bi(nd) for pjit
+        attention_vec = self.o(attention_vec)  # [b]i(nd),(nd)e->[b]ie
+        # attention_vec = maybe_shard(attention_vec, P("dp", None, None))  # XD: bi(nd) for pjit. Seems unnecessary?
+        return attention_vec
 
     def ff(self, x):
         dense_proj = self.dense_proj(x)
@@ -290,19 +309,24 @@ class TransformerLayerShard(hk.Module):
         return self.dense_proj_o(dense_proj)
 
     def qvk_proj(self, x):
-        q = self.q(x).reshape(x.shape[:-1] + (self.heads_per_shard, self.dim_per_head))
-        v = self.v(x).reshape(x.shape[:-1] + (self.heads_per_shard, self.dim_per_head))
-        k = self.k(x).reshape(x.shape[:-1] + (self.heads_per_shard, self.dim_per_head))
-
+        if self.concat_qkv:  # XD
+            qkv = self.qkv_proj(x)  # ...i(n3d)
+            qkv = qkv.reshape(qkv.shape[:-1] + (self.heads_per_shard, -1))  # ...in(3d)
+            q, v, k = jnp.split(qkv, [self.dim_per_head, self.dim_per_head * 2], axis=-1)  # [...ind]*3
+        else:
+            q = self.q(x).reshape(x.shape[:-1] + (self.heads_per_shard, self.dim_per_head)) # XDC: ...(nd)->...nd
+            v = self.v(x).reshape(x.shape[:-1] + (self.heads_per_shard, self.dim_per_head))
+            k = self.k(x).reshape(x.shape[:-1] + (self.heads_per_shard, self.dim_per_head))
+        q, k, v = [maybe_shard(x, P("dp", None, "mp", None)) for x in [q, k, v]]  # XD: bind for pjit
         return q, v, k
 
     def __call__(self, x, attn_bias):
-        x = f_psum(x)
+        if self.transformation == 'xmap': x = f_psum(x)  # XD: add if
         x = self.norm(x)
 
         q, v, k = self.qvk_proj(x)
 
-        seq_len = x.shape[0]
+        seq_len = x.shape[-2]  # XD: 0 -> -2, ...ie
         causal_mask = np.tril(np.ones((seq_len, seq_len)))
         bias = -1e10 * (1. - causal_mask)
         bias += attn_bias
@@ -310,7 +334,7 @@ class TransformerLayerShard(hk.Module):
         attn_out = self.self_attn(q, v, k, bias)
         dense_out = self.ff(x)
 
-        return g_psum(attn_out + dense_out)
+        return (g_psum if self.transformation == 'xmap' else lambda x: x)(attn_out + dense_out)  # XD: add if
 
     # iterate the decoding process by a single token
     def decode_once(self, decode_state, x, attn_bias):
@@ -384,11 +408,11 @@ class TransformerLayerShardV1(hk.Module):  # XD
                                 w_init=hk.initializers.TruncatedNormal(stddev=init_scale / np.sqrt(self.dim)))
 
     def self_attn(self, q, v, k, attn_bias):
-        k_rot = k[:, :, :, :self.d_rotary]
-        k_pass = k[:, :, :, self.d_rotary:]
+        k_rot = k[..., :self.d_rotary]
+        k_pass = k[..., self.d_rotary:]
 
-        q_rot = q[:, :, :, :self.d_rotary]
-        q_pass = q[:, :, :, self.d_rotary:]
+        q_rot = q[..., :self.d_rotary]
+        q_pass = q[..., self.d_rotary:]
 
         sincos = fixed_pos_embedding(k_rot, seq_dim=1)
         q_rot = apply_rotary_pos_emb_v2(q_rot, sincos)
@@ -402,7 +426,7 @@ class TransformerLayerShardV1(hk.Module):  # XD
         k = maybe_shard(k, P("dp", None, "mp", None))
         q = maybe_shard(q, P("dp", None, "mp", None))
 
-        attention_logits = jnp.einsum("bthd,bThd->bhtT", q, k)
+        attention_logits = jnp.einsum("...thd,...Thd->...htT", q, k)  # [b]ind,[b]jnd->[b]nij
 
         attention_logits = maybe_shard(attention_logits, P("dp", "mp", None, None))
 
@@ -415,8 +439,8 @@ class TransformerLayerShardV1(hk.Module):  # XD
         attention_weights = jax.nn.softmax(attention_logits)
         attention_weights = maybe_shard(attention_weights, P("dp", "mp", None, None))
 
-        attention_vec = jnp.einsum("bhtT,bThd->bthd", attention_weights, v)
-        attention_vec = attention_vec.reshape(attention_vec.shape[:2] + (-1,)) # bind->bie
+        attention_vec = jnp.einsum("...htT,...Thd->...thd", attention_weights, v) # [b]nij,[b]jnd->[b]ind
+        attention_vec = attention_vec.reshape(attention_vec.shape[:-2] + (-1,)) # bind->bi(nd)
 
         # attention_vec = maybe_shard(attention_vec, P("dp", None, "mp", None))
         # sharded_attn_vec = attention_vec.reshape(attention_vec.shape[:2] + (self.mp_num, self.n_head//self.mp_num, -1))  # XDC: bind->bip(n/p)d
@@ -432,12 +456,12 @@ class TransformerLayerShardV1(hk.Module):  # XD
         return self.fc_out(x)
 
     def __call__(self, x, attn_bias):
-        x = self.norm(x)
-        qkv = self.qkv_proj(x)  # bi(n3d)
-        qkv = qkv.reshape(qkv.shape[:-1] + (self.n_head, -1))  # bin(3d)
-        q, v, k = jnp.split(qkv, [self.d_head, self.d_head * 2], axis=-1)  # bind
+        x = self.norm(x)  # ...ie
+        qkv = self.qkv_proj(x)  # ...i(n3d)
+        qkv = qkv.reshape(qkv.shape[:-1] + (self.n_head, -1))  # ...in(3d)
+        q, v, k = jnp.split(qkv, [self.d_head, self.d_head * 2], axis=-1)  # [...ind]*3
 
-        seq_len = x.shape[1]
+        seq_len = x.shape[-2]
         causal_mask = np.tril(np.ones((seq_len, seq_len)))#[None, :, :]
         bias = -1e10 * (1. - causal_mask)
         bias += attn_bias
@@ -627,7 +651,8 @@ class ProjectionShard(hk.Module):
     def __init__(self, config, name=None):
         super().__init__(name=name)
         out_dim = config["n_vocab"]
-        shards = config["cores_per_replica"]
+        self.transformation = config.get('transformation', 'xmap')  # XD
+        shards = config["cores_per_replica"] if self.transformation == 'xmap' else 1  # XD: pmap or pjit
         norm = getnorm(config["norm"])
 
         assert out_dim % shards == 0
@@ -642,35 +667,37 @@ class ProjectionShard(hk.Module):
     def __call__(self, x):
         x = self.norm(x)
         proj = self.proj(x)
+        if self.transformation != 'xmap': return proj  # XD
 
         all_proj = jax.lax.all_gather(proj, 'shard')
 
         return hk.Flatten()(jnp.transpose(all_proj, (1, 0, 2)))
 
     def loss(self, x, targets, z_loss=1):
-        x = f_psum(x)
+        if self.transformation == 'xmap': x = f_psum(x)  # XD: add if
         x = self.norm(x)
         logits = self.proj(x)
 
-        shard_start_index = jax.lax.axis_index('shard') * self.dim_per_shard
-        global_max = jax.lax.pmax(jax.lax.stop_gradient(logits.max(-1, keepdims=True)), "shard")
-        logits -= jax.lax.stop_gradient(global_max)
+        if self.transformation == 'xmap':  # XD: add if else
+            shard_start_index = jax.lax.axis_index('shard') * self.dim_per_shard
+            global_max = jax.lax.pmax(jax.lax.stop_gradient(logits.max(-1, keepdims=True)), "shard")
+            logits -= jax.lax.stop_gradient(global_max)
+        else:
+            shard_start_index = 0
+            logits -= logits.max(-1, keepdims=True)
 
         gt_onehot = jax.nn.one_hot(targets - shard_start_index, self.dim_per_shard)
         predicted_logits = jnp.sum(jnp.multiply(gt_onehot, logits), axis=-1)
-        predicted_logits = g_psum(predicted_logits)
-
+        if self.transformation == 'xmap': predicted_logits = g_psum(predicted_logits)  # XD: add if
         exp_logits = jnp.exp(logits)
 
         sum_exp_logits = exp_logits.sum(axis=-1)
-        sum_exp_logits = g_psum(sum_exp_logits)
+        if self.transformation == 'xmap': sum_exp_logits = g_psum(sum_exp_logits)  # XD: add if
 
         loss = jnp.log(sum_exp_logits) - predicted_logits
 
         loss += (1e-4 * jnp.square(jnp.log(sum_exp_logits)) * z_loss).mean()
-
         correct = (0.0 == predicted_logits)
-
         return loss, correct
 
 

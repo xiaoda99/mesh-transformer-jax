@@ -18,7 +18,7 @@ from smart_open import open
 # from google.cloud import storage
 # from google.cloud.exceptions import NotFound
 
-from mesh_transformer.util import clip_by_global_norm, additive_weight_decay
+from mesh_transformer.util import clip_by_global_norm, additive_weight_decay, Timer  # XD
 
 
 def parse_args():
@@ -112,13 +112,13 @@ def train_step(network, data):
         "target": data[:, :, 1:],
     }
 
-    loss, last_loss, grad_norm, grad_norm_micro = network.train(inputs)
+    loss, last_loss = network.train(inputs)  # XD: remove , grad_norm, grad_norm_micro
 
     return (
         np.array(loss).mean(),
         np.array(last_loss).mean(),
-        np.array(grad_norm).mean(),
-        np.array(grad_norm_micro).mean(),
+        # np.array(grad_norm).mean(),  # XDD
+        # np.array(grad_norm_micro).mean(),  # XDD
     )
 
 
@@ -176,7 +176,7 @@ if __name__ == "__main__":
     
     opt = optax.chain(
         optax.scale(1 / gradient_accumulation_steps),
-        clip_by_global_norm(1),
+        clip_by_global_norm(1, use_psum=params.get('transformation', 'xmap') == 'xmap'),  # XD
         optax.scale_by_adam(),
         additive_weight_decay(weight_decay),
         optax.scale(-1),
@@ -260,8 +260,8 @@ if __name__ == "__main__":
 
     # load + run
     with jax.experimental.maps.Mesh(devices, ('dp', 'mp')):  # XD: mesh -> Mesh
-        print("initializing network")
-        network = CausalTransformer(params)
+        with Timer("initializing network"):  # XD
+            network = CausalTransformer(params)
 
         if initial_ckpt_state_path:
             print("loading network")
@@ -282,7 +282,7 @@ if __name__ == "__main__":
 
         print('compiling train fn')
         start = time.time()
-        loss, last_loss, grad_norm, grad_norm_micro = train_step(
+        loss, last_loss = train_step(  # XD: remove , grad_norm, grad_norm_micro
             # network, train_dataset.get_samples()  # XD
             network, next(train_dataset)
         )
@@ -332,7 +332,7 @@ if __name__ == "__main__":
                 exit()
 
             start = time.time()
-            loss, last_loss, grad_norm, grad_norm_micro = train_step(
+            loss, last_loss = train_step(  # XD: remove , grad_norm, grad_norm_micro
                 # network, train_dataset.get_samples()  # XD
                 network, next(train_dataset)
             )
@@ -343,29 +343,30 @@ if __name__ == "__main__":
             sequences_processed = sequences_per_step * step
             tokens_processed = tokens_per_step * step
 
-            ### compute summary stats about the gradient
+            if False:  # XD
+                ### compute summary stats about the gradient
 
-            # converts from grads-summed-over-microbatch (what `CasualTransformer.train` computes)
-            # to grads-averaged-over-microbatch (what we want)
-            #
-            # (when taking gradient steps, the same conversion happens inside the optimizer
-            #  via optax.scale(1 / gradient_accumulation_steps))
-            grad_norm = grad_norm / gradient_accumulation_steps
+                # converts from grads-summed-over-microbatch (what `CasualTransformer.train` computes)
+                # to grads-averaged-over-microbatch (what we want)
+                #
+                # (when taking gradient steps, the same conversion happens inside the optimizer
+                #  via optax.scale(1 / gradient_accumulation_steps))
+                grad_norm = grad_norm / gradient_accumulation_steps
 
-            # compute G_noise and S_noise
-            # from "An Empirical Model of Large-Batch Training" Appendix A.1
-            # here, B_big = gradient_accumulation_steps, and B_small = 1 for convenience
-            gbsmall = grad_norm_micro ** 2
-            gbbig = grad_norm ** 2
-            G_noise = (gradient_accumulation_steps * gbbig - gbsmall) / (
-                gradient_accumulation_steps - 1
-            )
-            S_noise = (gbsmall - gbbig) / (1 - 1 / gradient_accumulation_steps)
+                # compute G_noise and S_noise
+                # from "An Empirical Model of Large-Batch Training" Appendix A.1
+                # here, B_big = gradient_accumulation_steps, and B_small = 1 for convenience
+                gbsmall = grad_norm_micro ** 2
+                gbbig = grad_norm ** 2
+                G_noise = (gradient_accumulation_steps * gbbig - gbsmall) / (
+                    gradient_accumulation_steps - 1
+                )
+                S_noise = (gbsmall - gbbig) / (1 - 1 / gradient_accumulation_steps)
 
-            noise_scale_stats = {
-                "noise/G_noise": G_noise,
-                "noise/S_noise": S_noise,
-            }
+                noise_scale_stats = {
+                    "noise/G_noise": G_noise,
+                    "noise/S_noise": S_noise,
+                }
 
             # heuristic to avoid reporting G_noise in very early training when gradients are large
             # (these take a long time to wash out of the moving average that defines B_simple)
@@ -398,8 +399,8 @@ if __name__ == "__main__":
                 "train/last_loss": last_loss,
                 "train/steps_per_sec": steps_per_sec,
                 "train/tokens_per_sec": tokens_per_sec,
-                "train/grad_norm": grad_norm,
-                "train/learning_rate": float(scheduler(network.state["opt_state"][-1].count[0].item())),
+                # "train/grad_norm": grad_norm,  # XDD
+                # "train/learning_rate": float(scheduler(network.state["opt_state"][-1].count[0].item())),  # XDD
                 "sequences_processed": sequences_processed,
                 "tokens_processed": tokens_processed,
             }
