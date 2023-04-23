@@ -54,20 +54,13 @@ class CausalTransformerShard(hk.Module):
 
         attn_bias += mask
 
-        # x = hk.remat(self.embed)(context)
-
-        # for l in self.transformer_layers:
-        #     x = x + hk.remat(l)(x, attn_bias)
-
-        # return hk.remat(self.proj.loss)(x, target, z_loss)
-        
-        # XD: remove remat
-        x = self.embed(context)
+        remat = hk.remat if True else lambda x: x  # XD
+        x = remat(self.embed)(context)
 
         for l in self.transformer_layers:
-            x = x + l(x, attn_bias)
+            x = x + remat(l)(x, attn_bias)
 
-        return self.proj.loss(x, target, z_loss)
+        return remat(self.proj.loss)(x, target, z_loss)
 
     def loss(self, ctx, tgt, z_loss=False, mask=0.0):
         loss, correct = self.eval(ctx, tgt, float(z_loss), mask=mask)
@@ -175,7 +168,8 @@ class CausalTransformer:
                 val_grad_fn = jax.value_and_grad(train_loss_fn, has_aux=True)
                 (loss, last_loss), grad = val_grad_fn(to_bf16(state["params"]), ctx, tgt)
 
-                new_grad = jax.tree_multimap(lambda a, b: a + b, old_grad, grad)
+                # XD jax.tree_multimap removed in jax v0.3.16
+                new_grad = getattr(jax, 'tree_multimap', jax.tree_map)(lambda a, b: a + b, old_grad, grad)
                 # gnorm = global_norm(grad)  # XDD
                 return new_grad, (loss, last_loss)#, gnorm)  # XD: remove gnorm
 
@@ -281,7 +275,7 @@ class CausalTransformer:
         elif self.transformation == 'pjit':  # XD: adapted from CausalTransformerV2.__init__
             x = jnp.zeros((1, 4)).astype(jnp.uint32).astype(jnp.uint32)  # batch, seq
             state_shapes = jax.eval_shape(init, jax.random.PRNGKey(42), x)
-            param_shard = param_shapes_to_shard(state_shapes['params'], parallel='mp')
+            param_shard = param_shapes_to_shard(state_shapes['params'], parallel=['mp', 'dp'])
 
             # ref get_opt_spec in run_clm_mp.py (xd/few-shot) and shard_strategy in CausalTransformerV2
             def get_state_shard(x):

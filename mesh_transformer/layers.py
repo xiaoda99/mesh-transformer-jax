@@ -305,6 +305,7 @@ class TransformerLayerShard(hk.Module):
 
     def ff(self, x):
         dense_proj = self.dense_proj(x)
+        dense_proj = maybe_shard(dense_proj, P("dp", None, "mp"))  # XD: [b]ie
         dense_proj = jax.nn.gelu(dense_proj)
         return self.dense_proj_o(dense_proj)
 
