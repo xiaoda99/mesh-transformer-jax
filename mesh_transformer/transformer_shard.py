@@ -54,7 +54,7 @@ class CausalTransformerShard(hk.Module):
 
         attn_bias += mask
 
-````        remat = hk.remat if True else lambda x: x  # XD
+        remat = hk.remat if True else lambda x: x  # XD
         x = remat(self.embed)(context)
 
         for l in self.transformer_layers:
@@ -133,13 +133,14 @@ def param_shapes_to_shard(param_shapes, parallel, config=None):  # XD
 class CausalTransformer:
     def __init__(self, config):
         self.config = config
-        optimizer = config["optimizer"]
+        optimizer = config.get("optimizer")
+        with_optimizer = optimizer is not None  # XD: copied from V2
         self.transformation = config.get('transformation', 'xmap')  # XD
 
         def eval(state, ctx, tgt, ctx_length):
             def eval_loss(x, y, mask):
                 transformer = CausalTransformerShard(config)
-                return transformer.loss(x, y, mask=mask)
+                return transformer.loss(x, y, mask=mask)["loss"]  # XD: add ["loss"]
 
             eval_loss_fn = hk.without_apply_rng(hk.transform(eval_loss)).apply
 
@@ -201,11 +202,12 @@ class CausalTransformer:
 
             param_init_fn = hk.transform(hk.experimental.optimize_rng_use(train_loss)).init
             params = param_init_fn(key, x, x)
-            return {
+            state = {  # XD: return -> state =
                 "params": ("early_cast" in config and to_bf16 or to_f32)(params),
                 "step": np.array(0),
-                "opt_state": optimizer.init(params)
             }
+            if with_optimizer: state["opt_state"] = optimizer.init(params)  # XD: copied from V2
+            return state
 
         def generate(state, key, ctx, ctx_length, aux, sampler_options):
             sampler = config["sampler"]
@@ -275,7 +277,7 @@ class CausalTransformer:
         elif self.transformation == 'pjit':  # XD: adapted from CausalTransformerV2.__init__
             x = jnp.zeros((1, 4)).astype(jnp.uint32).astype(jnp.uint32)  # batch, seq
             state_shapes = jax.eval_shape(init, jax.random.PRNGKey(42), x)
-            param_shard = param_shapes_to_shard(state_shapes['params'], parallel=['mp', 'dp'])
+            param_shard = param_shapes_to_shard(state_shapes['params'], parallel=('mp', 'dp'))
 
             # ref get_opt_spec in run_clm_mp.py (xd/few-shot) and shard_strategy in CausalTransformerV2
             def get_state_shard(x):
@@ -294,8 +296,8 @@ class CausalTransformer:
                             out_axis_resources=state_shard)
 
             self.eval_ = self.eval_pjit = pjit(eval,
-                            in_axis_resources=(state_shard["params"], P("dp"), P("dp"), P("dp")),
-                            out_axis_resources=P("dp"))
+                            in_axis_resources=(state_shard, P("dp"), P("dp"), P("dp")),
+                            out_axis_resources=None)
 
             self.train_ = self.train_pjit = pjit(train,
                             in_axis_resources=(state_shard, P(None, "dp"), P(None, "dp")),

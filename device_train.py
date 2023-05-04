@@ -123,13 +123,14 @@ def train_step(network, data):
 
 
 def eval_step(network, data):
+    data = data['input_ids']  # XD
     inputs = {
         "obs": data[:, :-1],
         "target": data[:, 1:],
     }
 
     out = network.eval(inputs)
-    loss = out["loss"]
+    loss = out#["loss"]  # XDD
 
     return np.array(loss).mean()
 
@@ -174,16 +175,17 @@ if __name__ == "__main__":
 
     scheduler = util.gpt3_schedule(warmup_steps, anneal_steps, lr, end_lr)
     
-    opt = optax.chain(
-        optax.scale(1 / gradient_accumulation_steps),
-        clip_by_global_norm(1, use_psum=params.get('transformation', 'xmap') == 'xmap'),  # XD
-        optax.scale_by_adam(),
-        additive_weight_decay(weight_decay),
-        optax.scale(-1),
-        optax.scale_by_schedule(scheduler)
-    )
-
-    params["optimizer"] = opt
+    eval_mode = True  # XD
+    if not eval_mode:  # XD
+        opt = optax.chain(
+            optax.scale(1 / gradient_accumulation_steps),
+            clip_by_global_norm(1, use_psum=params.get('transformation', 'xmap') == 'xmap'),  # XD
+            optax.scale_by_adam(),
+            additive_weight_decay(weight_decay),
+            optax.scale(-1),
+            optax.scale_by_schedule(scheduler)
+        )
+        params["optimizer"] = opt
 
     start = time.time()
     tpu_size = jax.device_count()
@@ -246,6 +248,7 @@ if __name__ == "__main__":
     train_dataset = load_tfrecord_dataset(f"data/{params['train_set']}", batch_size=train_batch_size, seq_len=params['seq'])
 
     global_val_batch = per_replica_batch * tpu_size // cores_per_replica
+    if eval_mode: eval_dataset = load_tfrecord_dataset(f"data/{params['train_set']}", batch_size=(global_val_batch,), seq_len=params['seq'])  # XD
 
     val_sets = {}
 
@@ -255,7 +258,9 @@ if __name__ == "__main__":
         )
 
     # tok/sec metrics
-    sequences_per_step = gradient_accumulation_steps * (per_replica_batch * tpu_size // cores_per_replica)
+    sequences_per_step = gradient_accumulation_steps * (per_replica_batch * tpu_size // cores_per_replica) \
+        if not eval_mode else global_val_batch  # XD
+
     tokens_per_step = params['seq'] * sequences_per_step
 
     # load + run
@@ -280,21 +285,23 @@ if __name__ == "__main__":
 
             print(f"network loaded in {time.time() - start:.06}s")
 
-        print('compiling train fn')
-        start = time.time()
-        loss, last_loss = train_step(  # XD: remove , grad_norm, grad_norm_micro
-            # network, train_dataset.get_samples()  # XD
-            network, next(train_dataset)
-        )
-        step += 1
-        print(f"Train fn compiled in {time.time() - start:.06}s")
-
-        # print('compiling eval fn')  # XD
-        # start = time.time()
-        # for val_set in val_sets.values():
-        #     eval_step(network, val_set.get_samples())
-        #     val_set.reset()
-        # print(f"Eval fn compiled in {time.time() - start:.06}s")
+        if not eval_mode:  # XD
+            print('compiling train fn')
+            start = time.time()
+            loss, last_loss = train_step(  # XD: remove , grad_norm, grad_norm_micro
+                # network, train_dataset.get_samples()  # XD
+                network, next(train_dataset)
+            )
+            step += 1
+            print(f"Train fn compiled in {time.time() - start:.06}s")
+        else:
+            print('compiling eval fn')
+            start = time.time()
+            eval_step(network, next(eval_dataset))  # XD
+            # for val_set in val_sets.values():
+            #     eval_step(network, val_set.get_samples())
+            #     val_set.reset()
+            print(f"Eval fn compiled in {time.time() - start:.06}s")
 
         # project = params.get("wandb_project", "mesh-transformer-jax")  # XD
         # wandb.init(project=project, name=params["name"], config=params)
@@ -332,10 +339,13 @@ if __name__ == "__main__":
                 exit()
 
             start = time.time()
-            loss, last_loss = train_step(  # XD: remove , grad_norm, grad_norm_micro
-                # network, train_dataset.get_samples()  # XD
-                network, next(train_dataset)
-            )
+            if not eval_mode:  # XD
+                loss, last_loss = train_step(  # XD: remove , grad_norm, grad_norm_micro
+                    # network, train_dataset.get_samples()  # XD
+                    network, next(train_dataset)
+                )
+            else:
+                loss, last_loss = eval_step(network, next(eval_dataset)), 0.  # XD
             step += 1
 
             steps_per_sec = 1 / (time.time() - start)
